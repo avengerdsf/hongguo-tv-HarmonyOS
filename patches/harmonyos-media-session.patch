@@ -1,0 +1,1057 @@
+diff --git a/harmony/entry/src/main/module.json5 b/harmony/entry/src/main/module.json5
+--- a/harmony/entry/src/main/module.json5
++++ b/harmony/entry/src/main/module.json5
+@@ -33,12 +33,16 @@
+           }
+         ],
+         "launchType": "singleton",
+-        "continuable": true
++        "continuable": true,
++        "backgroundModes": ["audioPlayback"]
+       }
+     ],
+     "requestPermissions": [
+       {
+         "name": "ohos.permission.INTERNET"
++      },
++      {
++        "name": "ohos.permission.KEEP_BACKGROUND_RUNNING"
+       }
+     ]
+   }
+diff --git a/harmony/entry/src/main/ets/model/DisplaySettings.ets b/harmony/entry/src/main/ets/model/DisplaySettings.ets
+--- a/harmony/entry/src/main/ets/model/DisplaySettings.ets
++++ b/harmony/entry/src/main/ets/model/DisplaySettings.ets
+@@ -4,5 +4,7 @@
+ @ObservedV2
+ export class DisplaySettings {
+   @Trace colorMode: ConfigurationConstant.ColorMode = ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET;
++  @Trace backgroundPlayback: boolean = false;
++  @Trace automaticPip: boolean = false;
+   @Trace materialLevel: hdsMaterial.MaterialLevel = hdsMaterial.MaterialLevel.ADAPTIVE;
+ }
+diff --git a/harmony/entry/src/main/ets/model/HongguoApi.ets b/harmony/entry/src/main/ets/model/HongguoApi.ets
+--- a/harmony/entry/src/main/ets/model/HongguoApi.ets
++++ b/harmony/entry/src/main/ets/model/HongguoApi.ets
+@@ -48,6 +48,10 @@
+   publishText: string;
+ }
+ 
++export interface NextSeason extends ReservationItem {
++  playable: boolean;
++}
++
+ export interface ReservationList {
+   items: ReservationItem[];
+   hasMore: boolean;
+@@ -165,6 +169,7 @@
+   reservation_id?: string;
+   season_index?: number;
+   upcoming?: boolean;
++  playable?: boolean;
+   reserved?: boolean;
+   publish_text?: string;
+ }
+@@ -502,12 +507,12 @@
+     return this.list('lists/new', new Map<string, string>(), previous);
+   }
+ 
+-  async nextReservableSeason(seriesId: string): Promise<ReservationItem | undefined> {
++  async nextSeasonAfter(seriesId: string): Promise<NextSeason | undefined> {
+     const params = new Map<string, string>([['series_id', seriesId]]);
+     const series = await this.request<SeasonsJson>(endpoint('series/seasons', params));
+     const rows = series.items ?? [];
+-    if (!rows.some((row: ReservationJson): boolean =>
+-      row.upcoming === true && !row.reserved && validReservationId(row.reservation_id ?? ''))) {
++    if (!rows.some((row: ReservationJson): boolean => row.series_id !== seriesId &&
++      (row.playable === true || (row.upcoming === true && !row.reserved && validReservationId(row.reservation_id ?? ''))))) {
+       return undefined;
+     }
+     let season = rows.find((row: ReservationJson): boolean => row.series_id === seriesId)?.season_index ?? 0;
+@@ -519,11 +524,16 @@
+       return undefined;
+     }
+     const next = rows.filter((row: ReservationJson): boolean => row.season_index === season + 1);
+-    if (next.length !== 1 || !next[0].upcoming || next[0].reserved || next[0].series_id === seriesId ||
+-      !validReservationId(next[0].series_id) || !validReservationId(next[0].reservation_id ?? '')) {
++    if (next.length !== 1 || next[0].series_id === seriesId || !validReservationId(next[0].series_id)) {
+       return undefined;
+     }
+-    return reservationFromJson(next[0]);
++    const row = next[0];
++    const playable = row.playable === true && !row.upcoming;
++    if (!playable && (!row.upcoming || row.reserved || !validReservationId(row.reservation_id ?? ''))) {
++      return undefined;
++    }
++    const item = reservationFromJson(row);
++    return { drama: item.drama, reservationId: item.reservationId, publishText: item.publishText, playable: playable };
+   }
+ 
+   async reservations(upcoming: boolean, previous?: ReservationList): Promise<ReservationList> {
+diff --git a/harmony/entry/src/main/ets/model/PlaybackMediaSession.ets b/harmony/entry/src/main/ets/model/PlaybackMediaSession.ets
+new file mode 100644
+--- /dev/null
++++ b/harmony/entry/src/main/ets/model/PlaybackMediaSession.ets
+@@ -0,0 +1,223 @@
++import { common, WantAgent, wantAgent } from '@kit.AbilityKit';
++import { avSession } from '@kit.AVSessionKit';
++import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
++import { BusinessError, deviceInfo } from '@kit.BasicServicesKit';
++import { hilog } from '@kit.PerformanceAnalysisKit';
++
++const DOMAIN: number = 0x00F1;
++const TAG: string = 'HongguoMediaSession';
++
++export interface PlaybackMediaCommands {
++  play: () => void;
++  pause: () => void;
++  next: () => void;
++  previous: () => void;
++  seek: (milliseconds: number) => void;
++  backgroundInterrupted: () => void;
++}
++
++export interface PlaybackMediaUpdate {
++  metadata: avSession.AVMetadata;
++  state: avSession.AVPlaybackState;
++  allowBackground: boolean;
++  keepBackgroundTask: boolean;
++}
++
++let currentSession: PlaybackMediaSession | undefined;
++let platformWork: Promise<void> = Promise.resolve();
++
++function report(operation: string, error: BusinessError): void {
++  hilog.warn(DOMAIN, TAG, '%{public}s failed, code=%{public}d', operation, error.code ?? 0);
++}
++
++export class PlaybackMediaSession {
++  private readonly context: common.UIAbilityContext;
++  private readonly commands: PlaybackMediaCommands;
++  private session?: avSession.AVSession;
++  private launch?: WantAgent;
++  private pending?: PlaybackMediaUpdate;
++  private queued: boolean = false;
++  private closed: boolean = false;
++  private taskActive: boolean = false;
++  private taskRequested: boolean = false;
++  private taskId?: number;
++  private metadataKey: string = '';
++  private backgroundAllowed?: boolean;
++  private listeningForCancellation: boolean = false;
++
++  private onTaskCancelled = (info: backgroundTaskManager.ContinuousTaskCancelInfo): void => {
++    if (this.taskActive && (this.taskId === undefined || this.taskId === info.id)) {
++      this.taskActive = false;
++      this.taskId = undefined;
++      this.commands.backgroundInterrupted();
++    }
++  };
++
++  constructor(context: common.UIAbilityContext, commands: PlaybackMediaCommands) {
++    currentSession?.close();
++    currentSession = this;
++    this.context = context;
++    this.commands = commands;
++  }
++
++  get backgroundReady(): boolean {
++    return this.taskActive;
++  }
++
++  publish(update: PlaybackMediaUpdate): void {
++    if (this.closed) {
++      return;
++    }
++    this.pending = update;
++    if (this.queued) {
++      return;
++    }
++    this.queued = true;
++    platformWork = platformWork.then(async (): Promise<void> => {
++      while (this.pending && !this.closed) {
++        const next = this.pending;
++        this.pending = undefined;
++        try {
++          await this.apply(next);
++        } catch (error) {
++          report('Media state', error as BusinessError);
++        }
++      }
++      this.queued = false;
++    });
++  }
++
++  private async ensureSession(): Promise<avSession.AVSession> {
++    if (this.session) {
++      return this.session;
++    }
++    const session = await avSession.createAVSession(this.context, 'HongguoPlayback', 'video');
++    this.session = session;
++    session.on('play', (): void => {
++      if (!this.closed) {
++        hilog.info(DOMAIN, TAG, 'Media center play');
++        this.commands.play();
++      }
++    });
++    session.on('pause', (): void => {
++      if (!this.closed) {
++        hilog.info(DOMAIN, TAG, 'Media center pause');
++        this.commands.pause();
++      }
++    });
++    session.on('playNext', (): void => { if (!this.closed) { this.commands.next(); } });
++    session.on('playPrevious', (): void => { if (!this.closed) { this.commands.previous(); } });
++    session.on('seek', (time: number): void => { if (!this.closed) { this.commands.seek(time); } });
++    try {
++      await session.activate();
++    } catch (error) {
++      this.session = undefined;
++      await session.destroy().catch((): void => {});
++      report('Media session activation', error as BusinessError);
++      throw new Error('Media session activation failed');
++    }
++    try {
++      this.launch = await wantAgent.getWantAgent({
++        wants: [{ bundleName: this.context.abilityInfo.bundleName, abilityName: this.context.abilityInfo.name }],
++        actionType: wantAgent.OperationType.START_ABILITY,
++        requestCode: 0,
++        wantAgentFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG],
++      });
++      await session.setLaunchAbility(this.launch);
++    } catch (error) {
++      report('Media center launch action', error as BusinessError);
++    }
++    try {
++      backgroundTaskManager.on('continuousTaskCancel', this.onTaskCancelled);
++      this.listeningForCancellation = true;
++    } catch (error) {
++      report('Background task listener', error as BusinessError);
++    }
++    return session;
++  }
++
++  private async apply(update: PlaybackMediaUpdate): Promise<void> {
++    const session = await this.ensureSession();
++    if (this.closed) {
++      return;
++    }
++    const key = update.metadata.assetId + ':' + (update.metadata.duration ?? 0).toString();
++    if (key !== this.metadataKey) {
++      try {
++        await session.setAVMetadata(update.metadata);
++        this.metadataKey = key;
++      } catch (error) {
++        report('Media metadata', error as BusinessError);
++      }
++    }
++    if (deviceInfo.sdkApiVersion >= 24 && this.backgroundAllowed !== update.allowBackground) {
++      try {
++        await session.setBackgroundPlayMode(update.allowBackground ? avSession.BackgroundPlayMode.ENABLE_BACKGROUND_PLAY :
++          avSession.BackgroundPlayMode.DISABLE_BACKGROUND_PLAY);
++        this.backgroundAllowed = update.allowBackground;
++      } catch (error) {
++        report('Background play mode', error as BusinessError);
++      }
++    }
++    try {
++      await session.setAVPlaybackState(update.state);
++    } catch (error) {
++      report('AVSession playback state', error as BusinessError);
++    }
++    if (!update.keepBackgroundTask) {
++      this.taskRequested = false;
++      await this.stopBackgroundTask();
++    } else if (!this.closed && !this.taskRequested && this.launch) {
++      this.taskRequested = true;
++      try {
++        const task = await backgroundTaskManager.startBackgroundRunning(this.context, ['audioPlayback'], this.launch);
++        this.taskId = task.continuousTaskId;
++        this.taskActive = true;
++        hilog.info(DOMAIN, TAG, 'Audio playback background task started');
++      } catch (error) {
++        report('Background task start', error as BusinessError);
++      }
++    }
++  }
++
++  private async stopBackgroundTask(): Promise<void> {
++    if (!this.taskActive) {
++      return;
++    }
++    this.taskActive = false;
++    this.taskId = undefined;
++    try {
++      await backgroundTaskManager.stopBackgroundRunning(this.context);
++      hilog.info(DOMAIN, TAG, 'Audio playback background task stopped');
++    } catch (error) {
++      report('Background task stop', error as BusinessError);
++    }
++  }
++
++  close(): void {
++    if (this.closed) {
++      return;
++    }
++    this.closed = true;
++    this.pending = undefined;
++    if (currentSession === this) {
++      currentSession = undefined;
++    }
++    platformWork = platformWork.then(async (): Promise<void> => {
++      await this.stopBackgroundTask();
++      if (this.listeningForCancellation) {
++        try {
++          backgroundTaskManager.off('continuousTaskCancel', this.onTaskCancelled);
++        } catch (error) {
++          report('Background task listener cleanup', error as BusinessError);
++        }
++      }
++      try {
++        await this.session?.destroy();
++      } catch (error) {
++        report('Media session cleanup', error as BusinessError);
++      }
++      this.session = undefined;
++    });
++  }
++}
+diff --git a/harmony/entry/src/main/ets/pages/Index.ets b/harmony/entry/src/main/ets/pages/Index.ets
+--- a/harmony/entry/src/main/ets/pages/Index.ets
++++ b/harmony/entry/src/main/ets/pages/Index.ets
+@@ -229,6 +229,10 @@
+         topInset: this.lifecycle.statusBarHeight,
+         bottomInset: this.lifecycle.navigationBarHeight,
+         colorMode: this.displaySettings.colorMode,
++        backgroundPlayback: this.displaySettings.backgroundPlayback,
++        automaticPip: this.displaySettings.automaticPip,
++        onBackgroundPlaybackChange: (enabled: boolean): void => { this.displaySettings.backgroundPlayback = enabled; },
++        onAutomaticPipChange: (enabled: boolean): void => { this.displaySettings.automaticPip = enabled; },
+         onColorModeChange: (mode: ConfigurationConstant.ColorMode): void => {
+           if (this.applyColorMode(mode)) {
+             this.displaySettings.colorMode = mode;
+@@ -243,6 +247,12 @@
+     } else if (name === 'player') {
+       PlayerPage({
+         route: param as PlayerRoute,
++        backgroundPlayback: this.displaySettings.backgroundPlayback,
++        automaticPip: this.displaySettings.automaticPip,
++        onNextSeason: (drama: Drama): void => {
++          const route: PlayerRoute = { drama: drama, videoId: '', episodeIndex: 1, positionMs: 0 };
++          this.navStack.replacePath({ name: 'player', param: route });
++        },
+         accountRevision: this.accountRevision,
+         onLogin: (): void => { this.loginRequest++; },
+         onBack: (): void => { this.navStack.pop(); },
+diff --git a/harmony/entry/src/main/ets/pages/PlayerPage.ets b/harmony/entry/src/main/ets/pages/PlayerPage.ets
+--- a/harmony/entry/src/main/ets/pages/PlayerPage.ets
++++ b/harmony/entry/src/main/ets/pages/PlayerPage.ets
+@@ -4,7 +4,9 @@
+  * and view/player/FqPlayerSidebar.ets. https://github.com/crazypig321/FQHouseOH
+  */
+ 
++import { common } from '@kit.AbilityKit';
+ import { PiPWindow, window } from '@kit.ArkUI';
++import { avSession } from '@kit.AVSessionKit';
+ import { BusinessError, deviceInfo, settings } from '@kit.BasicServicesKit';
+ import { audio, AVVolumePanel } from '@kit.AudioKit';
+ import { media } from '@kit.MediaKit';
+@@ -13,9 +15,10 @@
+ import { ACCENT, ACCENT_FOREGROUND, failureMessage, INK, SURFACE, timeLabel } from '../components/DramaUi';
+ import { EpisodeGrid } from '../components/EpisodeGrid';
+ import { appLifecycle, AppLifecycle, PlaybackContinuation } from '../components/AppLifecycle';
+-import { Discussion, DiscussionItem, Drama, Episode, HongguoApi, HongguoResponseError, Library, LibraryEntry, PlaybackPreparation, PlaySource, ReservationItem } from '../model/HongguoApi';
++import { Discussion, DiscussionItem, Drama, Episode, HongguoApi, HongguoResponseError, Library, LibraryEntry, NextSeason, PlaybackPreparation, PlaySource } from '../model/HongguoApi';
+ 
+ import { NativeVideo } from '../model/NativeVideo';
++import { PlaybackMediaSession } from '../model/PlaybackMediaSession';
+ 
+ export interface PlayerRoute {
+   drama: Drama;
+@@ -84,6 +87,9 @@
+ @ComponentV2
+ export struct PlayerPage {
+   @Param @Require route: PlayerRoute;
++  @Param backgroundPlayback: boolean = false;
++  @Param automaticPip: boolean = false;
++  @Event onNextSeason: (drama: Drama) => void = (_drama: Drama): void => {};
+   @Param accountRevision: number = 0;
+   @Event onLogin: () => void = (): void => {};
+   @Event onBack: () => void = (): void => {};
+@@ -136,6 +142,11 @@
+   private surface: XComponentController = new XComponentController();
+   private surfaceId: string = '';
+   private pipController?: PiPWindow.PiPController;
++  private pipCreation?: Promise<PiPWindow.PiPController | undefined>;
++  private pipAutoArmed: boolean = false;
++  private backgroundTimer: number = -1;
++  private mediaSession?: PlaybackMediaSession;
++  private holdBackgroundDuringSwitch: boolean = false;
+   private pipStarting: boolean = false;
+   private mediaVolumeManager?: audio.AudioVolumeManager;
+   private mediaVolumeMin: number = 0;
+@@ -182,8 +193,8 @@
+   private hasPlayback: boolean = false;
+   private completed: boolean = false;
+   private libraryDirty: boolean = false;
+-  private reservationOffer?: ReservationItem;
+-  private reservationDialogOpen: boolean = false;
++  private seasonOffer?: NextSeason;
++  private seasonDialogOpen: boolean = false;
+   private awaitingReservationLogin: boolean = false;
+   private danmakuStart: number = -1;
+   private danmakuEnd: number = -1;
+@@ -251,6 +262,21 @@
+   aboutToAppear(): void {
+     this.alive = true;
+     this.lifecycle.playbackSnapshot = this.continuationSnapshot;
++    const context = this.getUIContext().getHostContext() as common.UIAbilityContext | undefined;
++    if (context) {
++      this.mediaSession = new PlaybackMediaSession(context, {
++        play: (): void => this.playFromSystem(),
++        pause: (): void => this.pauseFromSystem(),
++        next: (): void => this.stepEpisode(true),
++        previous: (): void => this.stepEpisode(false),
++        seek: (time: number): void => this.seekTo(time / 1000),
++        backgroundInterrupted: (): void => {
++          if (this.alive && !this.lifecycle.foreground && !this.pipActive) {
++            this.pauseForBackground();
++          }
++        },
++      });
++    }
+     try {
+       this.pipAvailable = PiPWindow.isPiPEnabled();
+     } catch (_error) {
+@@ -346,32 +372,130 @@
+     }
+   }
+ 
++  @Monitor('backgroundPlayback', 'automaticPip')
++  private playbackSettingsChanged(): void {
++    this.publishMediaState();
++    this.updateAutoPip();
++    if (!this.lifecycle.foreground) {
++      this.onForegroundChanged();
++    }
++  }
++
+   @Monitor('lifecycle.foreground')
+   private onForegroundChanged(): void {
+     if (!this.alive) {
+       return;
+     }
++    clearTimeout(this.backgroundTimer);
+     if (!this.lifecycle.foreground) {
+       if (this.prefetchedEpisode?.generation === this.generation) {
+         this.cancelEpisodePrefetch();
+       }
+-      if (this.pipActive || this.pipStarting) {
++      this.saveProgress();
++      clearTimeout(this.controlsTimer);
++      if (!this.playing || this.canKeepPlaying()) {
+         return;
+       }
+-      this.resumeOnForeground = this.playing;
+-      this.saveProgress();
+-      if (this.playing) {
+-        this.attempt?.controller.pause();
+-      }
+-      clearTimeout(this.controlsTimer);
++      if (this.pipAutoArmed || this.backgroundPlayback) {
++        // PiP and long-task activation can arrive after the window loses foreground.
++        this.backgroundTimer = setTimeout((): void => {
++          if (this.alive && !this.canKeepPlaying()) {
++            this.pauseForBackground();
++          }
++        }, 1200);
++      } else {
++        this.pauseForBackground();
++      }
+     } else {
+       if (this.resumeOnForeground) {
+         this.resumeOnForeground = false;
+         this.attempt?.controller.start();
+       }
++      this.updateAutoPip();
+       this.syncMediaVolume();
+-      this.presentReservationOffer();
+-    }
++      this.presentSeasonOffer();
++    }
++  }
++
++  private canKeepPlaying(): boolean {
++    return this.lifecycle.foreground || this.pipActive || this.pipStarting ||
++      (this.backgroundPlayback && this.mediaSession?.backgroundReady === true);
++  }
++
++  private pauseForBackground(): void {
++    if (this.playing) {
++      this.resumeOnForeground = true;
++      this.attempt?.controller.pause();
++    }
++  }
++
++  private playFromSystem(): void {
++    if (!this.alive || this.loading || this.error || this.playing ||
++      (!this.lifecycle.foreground && !this.pipActive && !this.backgroundPlayback)) {
++      return;
++    }
++    this.togglePlaying();
++  }
++
++  private pauseFromSystem(): void {
++    this.resumeOnForeground = false;
++    this.attempt?.controller.pause();
++  }
++
++  private stepEpisode(forward: boolean): void {
++    const episodes = this.drama?.episodes;
++    const current = this.selected;
++    if (!this.alive || !episodes || !current || this.loading ||
++      (!this.lifecycle.foreground && !this.pipActive && !this.backgroundPlayback)) {
++      return;
++    }
++    const index = episodes.findIndex((episode: Episode): boolean => episode.videoId === current.videoId);
++    const target = index >= 0 ? episodes[index + (forward ? 1 : -1)] : undefined;
++    if (target) {
++      this.selectEpisode(target);
++    }
++  }
++
++  private publishMediaState(): void {
++    const drama = this.drama;
++    const episode = this.selected;
++    if (!this.mediaSession || !drama || !episode) {
++      return;
++    }
++    const state = this.error ? avSession.PlaybackState.PLAYBACK_STATE_ERROR :
++      this.completed ? avSession.PlaybackState.PLAYBACK_STATE_COMPLETED :
++        this.playing ? avSession.PlaybackState.PLAYBACK_STATE_PLAY :
++          this.loading ? avSession.PlaybackState.PLAYBACK_STATE_PREPARE : avSession.PlaybackState.PLAYBACK_STATE_PAUSE;
++    this.mediaSession.publish({
++      metadata: {
++        assetId: episode.videoId,
++        title: drama.title,
++        artist: this.episodeLabel,
++        mediaImage: drama.cover || undefined,
++        duration: Math.round(this.duration * 1000),
++      },
++      state: {
++        state: state,
++        speed: parseFloat(this.speedLabel) || 1,
++        position: { elapsedTime: Math.round(this.positionSeconds * 1000), updateTime: Date.now() },
++      },
++      allowBackground: this.backgroundPlayback || this.pipActive || this.pipStarting || this.pipAutoArmed,
++      keepBackgroundTask: this.backgroundPlayback && (this.playing || this.holdBackgroundDuringSwitch),
++    });
++  }
++
++  private seekTo(value: number): void {
++    if (!this.alive || this.loading || this.duration <= 0 || !Number.isFinite(value)) {
++      return;
++    }
++    const seconds = Math.max(0, Math.min(value, this.duration));
++    this.attempt?.controller.setCurrentTime(seconds);
++    this.positionSeconds = seconds;
++    this.seekPreview = -1;
++    this.resetDanmaku();
++    this.loadDanmaku();
++    this.publishMediaState();
++    this.scheduleControls();
+   }
+ 
+   private leave(): void {
+@@ -393,6 +517,9 @@
+     this.commentGeneration++;
+     clearTimeout(this.controlsTimer);
+     clearTimeout(this.gestureTimer);
++    clearTimeout(this.backgroundTimer);
++    this.mediaSession?.close();
++    this.mediaSession = undefined;
+     this.restoreBrightness();
+     this.releaseMediaVolume();
+     this.closePip();
+@@ -432,6 +559,7 @@
+     }
+     const generation: number = ++this.generation;
+     this.autoPlayOnPrepare = autoPlay;
++    this.holdBackgroundDuringSwitch = autoPlay && this.mediaSession?.backgroundReady === true;
+     this.attempt?.controller.stop();
+     this.attempt = undefined;
+     if (this.selected?.videoId !== episode.videoId) {
+@@ -445,7 +573,7 @@
+     this.loading = true;
+     this.playing = false;
+     this.completed = false;
+-    this.reservationOffer = undefined;
++    this.seasonOffer = undefined;
+     this.awaitingReservationLogin = false;
+     this.error = '';
+     this.playbackErrorCode = '';
+@@ -459,6 +587,8 @@
+     this.commentsVisible = false;
+     this.commentGeneration++;
+     this.resetDanmaku();
++    this.publishMediaState();
++    this.updateAutoPip();
+     try {
+       let source: PlaySource | undefined;
+       if (reuse && prepared) {
+@@ -488,6 +618,8 @@
+         this.error = codecMode === 'h264' && message === 'VIDEO_MODEL_NO_QUALITY' ?
+           '设备未能播放 HEVC，也未取到可用的 H.264 片源' :
+           message === this.playbackErrorCode ? '获取播放地址失败' : message;
++        this.holdBackgroundDuringSwitch = false;
++        this.publishMediaState();
+       }
+     }
+   }
+@@ -520,9 +652,7 @@
+         if (attempt.id === this.generation && width > 0 && height > 0) {
+           this.videoAspectRatio = width / height;
+           try {
+-            if (this.pipActive) {
+-              this.pipController?.updateContentSize(width, height);
+-            }
++            this.pipController?.updateContentSize(width, height);
+           } catch (_error) {
+             // The PiP window can close while the source dimensions change.
+           }
+@@ -536,10 +666,93 @@
+     });
+   }
+ 
+-  private async openPip(): Promise<void> {
++  private async ensurePipController(): Promise<PiPWindow.PiPController | undefined> {
++    if (this.pipController) {
++      return this.pipController;
++    }
++    if (!this.pipCreation) {
++      this.pipCreation = this.createPipController().finally((): void => { this.pipCreation = undefined; });
++    }
++    return this.pipCreation;
++  }
++
++  private async createPipController(): Promise<PiPWindow.PiPController | undefined> {
+     const attempt = this.attempt;
+     const context = this.getUIContext().getHostContext();
+-    if (!context || !attempt || this.pipStarting || !this.pipAvailable || this.loading || this.error.length > 0) {
++    if (!context || !attempt) {
++      return undefined;
++    }
++    const controller = await PiPWindow.create({
++      context: context,
++      componentController: this.surface,
++      navigationId: 'main_nav',
++      templateType: PiPWindow.PiPTemplateType.VIDEO_PLAY,
++      contentWidth: attempt.controller.width || 1080,
++      contentHeight: attempt.controller.height || 1920,
++    });
++    if (!this.alive) {
++      return undefined;
++    }
++    this.pipController = controller;
++    controller.on('stateChange', (state: PiPWindow.PiPState): void => {
++      if (controller !== this.pipController) {
++        return;
++      }
++      if (state === PiPWindow.PiPState.STARTED) {
++        this.pipActive = true;
++        clearTimeout(this.backgroundTimer);
++        this.syncPipControls();
++        this.publishMediaState();
++        hilog.info(0x00F1, 'HongguoPlayer', 'Picture-in-picture started');
++      } else if (state === PiPWindow.PiPState.STOPPED || state === PiPWindow.PiPState.ERROR) {
++        this.closePip(false);
++      }
++    });
++    controller.on('controlEvent', (event: PiPWindow.ControlEventParam): void => {
++      if (controller === this.pipController && event.controlType === PiPWindow.PiPControlType.VIDEO_PLAY_PAUSE) {
++        if (event.status === PiPWindow.PiPControlStatus.PLAY) {
++          this.playFromSystem();
++        } else {
++          this.pauseFromSystem();
++        }
++      }
++    });
++    return controller;
++  }
++
++  private setPipAutoStart(enabled: boolean): void {
++    if (!this.pipController || enabled === this.pipAutoArmed) {
++      return;
++    }
++    try {
++      this.pipController.setAutoStartEnabled(enabled);
++      this.pipAutoArmed = enabled;
++      this.publishMediaState();
++    } catch (_error) {
++      hilog.warn(0x00F1, 'HongguoPlayer', 'Automatic picture-in-picture setting failed');
++    }
++  }
++
++  private async updateAutoPip(): Promise<void> {
++    if (!this.automaticPip || !this.playing || !this.pipAvailable) {
++      this.setPipAutoStart(false);
++      return;
++    }
++    if (!this.alive || !this.lifecycle.foreground || this.pipActive || this.pipAutoArmed) {
++      return;
++    }
++    try {
++      const controller = await this.ensurePipController();
++      if (controller && this.alive && this.automaticPip && this.playing && this.lifecycle.foreground) {
++        this.setPipAutoStart(true);
++      }
++    } catch (_error) {
++      hilog.warn(0x00F1, 'HongguoPlayer', 'Automatic picture-in-picture preparation failed');
++    }
++  }
++
++  private async openPip(): Promise<void> {
++    if (!this.attempt || this.pipStarting || !this.pipAvailable || this.loading || this.error.length > 0) {
+       return;
+     }
+     if (this.pipActive) {
+@@ -547,46 +760,18 @@
+       return;
+     }
+     this.pipStarting = true;
++    this.publishMediaState();
+     try {
+-      const controller = await PiPWindow.create({
+-        context: context,
+-        componentController: this.surface,
+-        navigationId: 'main_nav',
+-        templateType: PiPWindow.PiPTemplateType.VIDEO_PLAY,
+-        contentWidth: attempt.controller.width || 1080,
+-        contentHeight: attempt.controller.height || 1920,
+-      });
+-      if (!this.alive || attempt !== this.attempt) {
+-        return;
+-      }
+-      this.pipController = controller;
+-      controller.on('stateChange', (state: PiPWindow.PiPState): void => {
+-        if (controller !== this.pipController) {
+-          return;
+-        }
+-        if (state === PiPWindow.PiPState.STARTED) {
+-          this.pipActive = true;
+-          this.syncPipControls();
+-          hilog.info(0x00F1, 'HongguoPlayer', 'Picture-in-picture started');
+-        } else if (state === PiPWindow.PiPState.STOPPED || state === PiPWindow.PiPState.ERROR) {
+-          this.closePip(false);
+-        }
+-      });
+-      controller.on('controlEvent', (event: PiPWindow.ControlEventParam): void => {
+-        if (event.controlType === PiPWindow.PiPControlType.VIDEO_PLAY_PAUSE) {
+-          if (event.status === PiPWindow.PiPControlStatus.PLAY) {
+-            this.attempt?.controller.start();
+-          } else {
+-            this.attempt?.controller.pause();
+-          }
+-        }
+-      });
+-      await controller.startPiP();
++      const controller = await this.ensurePipController();
++      if (controller && this.alive && this.lifecycle.foreground) {
++        await controller.startPiP();
++      }
+     } catch (_error) {
+       this.closePip(false);
+       this.showMessage('无法启动画中画');
+     } finally {
+       this.pipStarting = false;
++      this.publishMediaState();
+       if (!this.pipActive && !this.lifecycle.foreground) {
+         this.onForegroundChanged();
+       }
+@@ -597,7 +782,9 @@
+     const controller = this.pipController;
+     this.pipController = undefined;
+     this.pipActive = false;
++    this.pipAutoArmed = false;
+     try {
++      controller?.setAutoStartEnabled(false);
+       controller?.off('stateChange');
+       controller?.off('controlEvent');
+       if (stop) {
+@@ -606,9 +793,11 @@
+     } catch (_error) {
+       // The system may have already closed the PiP window.
+     }
+-    if (!this.pipStarting) {
++    this.publishMediaState();
++    if (!this.pipStarting && this.alive) {
+       if (this.lifecycle.foreground) {
+-        this.presentReservationOffer();
++        this.updateAutoPip();
++        this.presentSeasonOffer();
+       } else {
+         this.onForegroundChanged();
+       }
+@@ -641,7 +830,9 @@
+     if (!this.autoPlayOnPrepare) {
+       this.loading = false;
+       this.controls = true;
+-    } else if (this.lifecycle.foreground || this.pipActive) {
++      this.holdBackgroundDuringSwitch = false;
++      this.publishMediaState();
++    } else if (this.canKeepPlaying()) {
+       attempt.controller.start();
+     } else {
+       this.resumeOnForeground = true;
+@@ -674,6 +865,9 @@
+     this.playing = false;
+     this.error = '视频播放失败';
+     this.playbackErrorCode = code ? code.toString() : 'PLAYBACK_FAILED';
++    this.holdBackgroundDuringSwitch = false;
++    this.publishMediaState();
++    this.updateAutoPip();
+   }
+ 
+   private started(attempt: PlaybackAttempt): void {
+@@ -683,9 +877,11 @@
+     this.loading = false;
+     this.playing = true;
+     this.hasPlayback = true;
+-    if (!this.lifecycle.foreground && !this.pipActive && !this.pipStarting) {
+-      this.resumeOnForeground = true;
+-      attempt.controller.pause();
++    this.holdBackgroundDuringSwitch = false;
++    this.publishMediaState();
++    this.updateAutoPip();
++    if (!this.lifecycle.foreground && !this.canKeepPlaying()) {
++      this.onForegroundChanged();
+     }
+     this.syncPipControls();
+     this.scheduleControls();
+@@ -700,6 +896,7 @@
+       this.firstUpdate = false;
+       hilog.info(0x00F1, 'HongguoPlayer', 'Playback advancing for episode %{public}d at %{public}d s',
+         this.selected?.index ?? 0, Math.floor(time));
++      this.publishMediaState();
+     }
+     if (Date.now() - this.lastSaveAt >= 5000) {
+       this.saveProgress();
+@@ -737,6 +934,9 @@
+       this.playing = false;
+       clearTimeout(this.controlsTimer);
+       this.controls = true;
++      this.holdBackgroundDuringSwitch = false;
++      this.publishMediaState();
++      this.updateAutoPip();
+       this.syncPipControls();
+       this.saveProgress();
+     }
+@@ -755,18 +955,23 @@
+     const episode: Episode | undefined = nextEpisode(this.drama?.episodes ?? [], this.selected?.index ?? 0);
+     if (episode) {
+       this.openEpisode(episode);
+-    } else if (this.drama && this.selected &&
+-      this.selected.index >= Math.max(this.drama.episodeCount, this.drama.episodes.length)) {
+-      this.findReservationOffer(attempt.id, this.drama.seriesId);
+-    }
+-  }
+-
+-  private async findReservationOffer(generation: number, seriesId: string): Promise<void> {
++    } else {
++      this.holdBackgroundDuringSwitch = false;
++      this.publishMediaState();
++      this.updateAutoPip();
++      if (this.drama && this.selected &&
++        this.selected.index >= Math.max(this.drama.episodeCount, this.drama.episodes.length)) {
++        this.findSeasonOffer(attempt.id, this.drama.seriesId);
++      }
++    }
++  }
++
++  private async findSeasonOffer(generation: number, seriesId: string): Promise<void> {
+     try {
+-      const offer = await this.api.nextReservableSeason(seriesId);
++      const offer = await this.api.nextSeasonAfter(seriesId);
+       if (offer && this.alive && generation === this.generation && this.completed) {
+-        this.reservationOffer = offer;
+-        this.presentReservationOffer();
++        this.seasonOffer = offer;
++        this.presentSeasonOffer();
+       }
+     } catch (_error) {
+       hilog.warn(0x00F1, 'HongguoPlayer', 'Next season reservation check failed');
+@@ -777,7 +982,7 @@
+   private resumeReservationAfterLogin(): void {
+     if (this.awaitingReservationLogin) {
+       this.awaitingReservationLogin = false;
+-      this.presentReservationOffer();
++      this.presentSeasonOffer();
+     }
+   }
+ 
+@@ -786,15 +991,32 @@
+       this.lifecycle.foreground && !this.pipActive && !this.pipStarting;
+   }
+ 
+-  private async presentReservationOffer(): Promise<void> {
+-    const offer = this.reservationOffer;
++  private async presentSeasonOffer(): Promise<void> {
++    const offer = this.seasonOffer;
+     const generation = this.generation;
+-    if (!offer || !this.canPresentReservation(generation) || this.reservationDialogOpen ||
++    if (!offer || !this.canPresentReservation(generation) || this.seasonDialogOpen ||
+       this.awaitingReservationLogin) {
+       return;
+     }
+-    this.reservationDialogOpen = true;
++    this.seasonDialogOpen = true;
+     try {
++      if (offer.playable) {
++        const result = await this.getUIContext().getPromptAction().showDialog({
++          title: '下一季已上线',
++          message: '本季已播完，可以继续看《' + offer.drama.title + '》。',
++          buttons: [
++            { text: '稍后', color: INK },
++            { text: '继续播放', color: ACCENT_FOREGROUND },
++          ],
++        }).catch((): undefined => undefined);
++        if (this.alive && generation === this.generation && this.seasonOffer === offer) {
++          this.seasonOffer = undefined;
++          if (result?.index === 1) {
++            this.onNextSeason(offer.drama);
++          }
++        }
++        return;
++      }
+       const account = await this.api.account();
+       if (!this.canPresentReservation(generation)) {
+         return;
+@@ -808,16 +1030,16 @@
+           { text: account.loggedIn ? '预约提醒' : '登录预约', color: ACCENT_FOREGROUND },
+         ],
+       }).catch((): undefined => undefined);
+-      if (!this.alive || generation !== this.generation || this.reservationOffer !== offer) {
++      if (!this.alive || generation !== this.generation || this.seasonOffer !== offer) {
+         return;
+       }
+       if (result?.index !== 1) {
+-        this.reservationOffer = undefined;
++        this.seasonOffer = undefined;
+       } else if (!account.loggedIn) {
+         this.awaitingReservationLogin = true;
+         this.onLogin();
+       } else {
+-        this.reservationOffer = undefined;
++        this.seasonOffer = undefined;
+         const confirmed = await this.api.setReservation(offer.reservationId, true);
+         this.onReservationChange();
+         if (this.alive && generation === this.generation) {
+@@ -829,7 +1051,7 @@
+         this.showMessage(failureMessage(error as Error));
+       }
+     } finally {
+-      this.reservationDialogOpen = false;
++      this.seasonDialogOpen = false;
+     }
+   }
+ 
+@@ -1274,6 +1496,7 @@
+           .onClick((): void => {
+             this.speed = option.value;
+             this.attempt?.controller.setSpeed(this.speed);
++            this.publishMediaState();
+             this.scheduleControls();
+           })
+       }, (option: SpeedOption): string => option.label)
+@@ -1337,12 +1560,7 @@
+             clearTimeout(this.controlsTimer);
+             this.seekPreview = value;
+           } else if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+-            this.attempt?.controller.setCurrentTime(value);
+-            this.positionSeconds = value;
+-            this.seekPreview = -1;
+-            this.resetDanmaku();
+-            this.loadDanmaku();
+-            this.scheduleControls();
++            this.seekTo(value);
+           }
+         })
+       Text(timeLabel(this.duration)).fontSize(12).fontColor(Color.White)
+@@ -1771,7 +1989,8 @@
+     .background(Color.Black)
+     .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
+     .onHidden((): void => {
+-      if (!this.pipActive && !this.pipStarting) {
++      if (!this.pipActive && !this.pipStarting &&
++        (this.lifecycle.foreground || (!this.canKeepPlaying() && !this.pipAutoArmed))) {
+         this.leave();
+       }
+     })
+diff --git a/harmony/entry/src/main/ets/pages/ProfilePage.ets b/harmony/entry/src/main/ets/pages/ProfilePage.ets
+--- a/harmony/entry/src/main/ets/pages/ProfilePage.ets
++++ b/harmony/entry/src/main/ets/pages/ProfilePage.ets
+@@ -36,7 +36,7 @@
+   @Local pendingRemoval: PendingRemoval | undefined = undefined;
+ 
+   private libraryTabs: SegmentButtonV2Items = new SegmentButtonV2Items([
+-    { text: '观看历史' }, { text: '收藏' },
++    { text: '历史' }, { text: '收藏' },
+   ]);
+   private api: HongguoApi = new HongguoApi();
+   private request: number = 0;
+diff --git a/harmony/entry/src/main/ets/pages/SettingsPage.ets b/harmony/entry/src/main/ets/pages/SettingsPage.ets
+--- a/harmony/entry/src/main/ets/pages/SettingsPage.ets
++++ b/harmony/entry/src/main/ets/pages/SettingsPage.ets
+@@ -61,6 +61,10 @@
+ export struct SettingsPage {
+   @Param materialLevel: hdsMaterial.MaterialLevel = hdsMaterial.MaterialLevel.ADAPTIVE;
+   @Param immersiveAvailable: boolean = false;
++  @Param backgroundPlayback: boolean = false;
++  @Param automaticPip: boolean = false;
++  @Event onBackgroundPlaybackChange: (value: boolean) => void = (_value: boolean): void => {};
++  @Event onAutomaticPipChange: (value: boolean) => void = (_value: boolean): void => {};
+   @Param heightVp: number = 0;
+   @Param topInset: number = 0;
+   @Param bottomInset: number = 0;
+@@ -98,11 +102,41 @@
+     .onClick((): void => select(option.value))
+   }
+ 
++  @Builder
++  private PlaybackSwitch(title: string, description: string, value: boolean, id: string,
++    change: (enabled: boolean) => void) {
++    Row({ space: 12 }) {
++      Column({ space: 4 }) {
++        Text(title).fontColor(INK).fontSize(16)
++        Text(description).fontColor(MUTED).fontSize(13)
++      }
++      .layoutWeight(1)
++      .alignItems(HorizontalAlign.Start)
++      Toggle({ type: ToggleType.Switch, isOn: value })
++        .selectedColor(ACCENT)
++        .id(id)
++        .accessibilityText(title)
++        .onChange(change)
++    }
++    .width('100%')
++    .constraintSize({ minHeight: 64 })
++    .padding({ left: 16, right: 16, top: 10, bottom: 10 })
++    .borderRadius(20)
++    .backgroundColor(SURFACE)
++  }
++
+   build() {
+     HdsNavDestination() {
+       Stack({ alignContent: Alignment.Bottom }) {
+         Scroll(this.scroller) {
+           Column({ space: 12 }) {
++            Text('播放').fontColor(INK).fontSize(18).fontWeight(FontWeight.Medium)
++            this.PlaybackSwitch('后台播放', '退到后台或锁屏时继续播放声音', this.backgroundPlayback,
++              'hongguo-background-playback-setting', (enabled: boolean): void => this.onBackgroundPlaybackChange(enabled))
++            Text('画中画').fontColor(INK).fontSize(18).fontWeight(FontWeight.Medium).margin({ top: 12 })
++            this.PlaybackSwitch('自动画中画', '视频播放时返回桌面，自动进入小窗', this.automaticPip,
++              'hongguo-automatic-pip-setting', (enabled: boolean): void => this.onAutomaticPipChange(enabled))
++
+             Text('沉浸光感').fontColor(INK).fontSize(18).fontWeight(FontWeight.Medium)
+             Column() {
+               ForEach(MATERIAL_OPTIONS, (option: DisplayOption, index: number) => {

@@ -1,0 +1,429 @@
+diff --git a/harmony/entry/src/main/ets/pages/PlayerPage.ets b/harmony/entry/src/main/ets/pages/PlayerPage.ets
+--- a/harmony/entry/src/main/ets/pages/PlayerPage.ets
++++ b/harmony/entry/src/main/ets/pages/PlayerPage.ets
+@@ -59,6 +59,13 @@
+   { label: '3×', value: media.PlaybackSpeed.SPEED_FORWARD_3_00_X },
+ ];
+ 
++interface LandscapeRestore {
++  mainWindow: window.Window;
++  orientation: window.Orientation;
++  statusVisible: boolean;
++  collapsed: boolean;
++}
++
+ interface EpisodePrefetch {
+   generation: number;
+   videoId: string;
+@@ -101,9 +108,13 @@
+   @Local selected: Episode | undefined = undefined;
+   @Local attempt: PlaybackAttempt | undefined = undefined;
+   @Local widthVp: number = 0;
++  @Local heightVp: number = 0;
++  @Local landscapeFullscreen: boolean = false;
++  @Local landscapeChanging: boolean = false;
+   @Local videoWidthVp: number = 0;
+   @Local videoHeightVp: number = 0;
+   @Local videoAspectRatio: number = 0;
++  @Local episodeSlideY: number = 0;
+   @Local loading: boolean = true;
+   @Local error: string = '';
+   @Local playbackErrorCode: string = '';
+@@ -145,8 +156,13 @@
+   private pipCreation?: Promise<PiPWindow.PiPController | undefined>;
+   private pipAutoArmed: boolean = false;
+   private backgroundTimer: number = -1;
++  private landscapeRestore?: LandscapeRestore;
++  private landscapeWork: Promise<void> = Promise.resolve();
+   private mediaSession?: PlaybackMediaSession;
+   private holdBackgroundDuringSwitch: boolean = false;
++  private episodeSlideDirection: number = 0;
++  private episodeSlidingOut: boolean = false;
++  private episodeSlideTimer: number = -1;
+   private pipStarting: boolean = false;
+   private mediaVolumeManager?: audio.AudioVolumeManager;
+   private mediaVolumeMin: number = 0;
+@@ -204,7 +220,14 @@
+ 
+   @Computed
+   get wide(): boolean {
+-    return this.widthVp >= 840;
++    return !this.landscapeFullscreen && this.widthVp >= 840;
++  }
++
++  @Computed
++  get landscapeButtonVisible(): boolean {
++    return this.landscapeFullscreen || (this.videoAspectRatio > 1 && !this.loading && !this.error &&
++      (deviceInfo.deviceType === 'phone' ||
++        (deviceInfo.deviceType === 'tablet' && this.widthVp > 0 && this.widthVp < this.heightVp)));
+   }
+ 
+   @Computed
+@@ -518,8 +541,11 @@
+     clearTimeout(this.controlsTimer);
+     clearTimeout(this.gestureTimer);
+     clearTimeout(this.backgroundTimer);
++    clearTimeout(this.episodeSlideTimer);
++    this.episodeSlidingOut = false;
+     this.mediaSession?.close();
+     this.mediaSession = undefined;
++    this.exitLandscapeFullscreen();
+     this.restoreBrightness();
+     this.releaseMediaVolume();
+     this.closePip();
+@@ -536,6 +562,10 @@
+       this.setFullscreen(true);
+       return;
+     }
++    if (this.landscapeFullscreen) {
++      this.exitLandscapeFullscreen();
++      return;
++    }
+     if (this.fullscreen) {
+       this.setFullscreen(false);
+       return;
+@@ -545,7 +575,7 @@
+   }
+ 
+   private async openEpisode(episode: Episode, resumeSeconds: number = 0, fullTransport: boolean = false,
+-    codecMode: string = '', quality: string = '', autoPlay: boolean = true): Promise<void> {
++    codecMode: string = '', quality: string = '', autoPlay: boolean = true, slideDirection: number = 0): Promise<void> {
+     if (!this.drama || !this.alive) {
+       return;
+     }
+@@ -559,6 +589,10 @@
+     }
+     const generation: number = ++this.generation;
+     this.autoPlayOnPrepare = autoPlay;
++    clearTimeout(this.episodeSlideTimer);
++    this.episodeSlidingOut = false;
++    this.episodeSlideDirection = slideDirection;
++    this.episodeSlideY = slideDirection * this.videoHeightVp;
+     this.holdBackgroundDuringSwitch = autoPlay && this.mediaSession?.backgroundReady === true;
+     this.attempt?.controller.stop();
+     this.attempt = undefined;
+@@ -651,6 +685,9 @@
+       sizeChanged: (width: number, height: number): void => {
+         if (attempt.id === this.generation && width > 0 && height > 0) {
+           this.videoAspectRatio = width / height;
++          if (this.landscapeFullscreen && width <= height) {
++            this.exitLandscapeFullscreen();
++          }
+           try {
+             this.pipController?.updateContentSize(width, height);
+           } catch (_error) {
+@@ -877,6 +914,7 @@
+     this.loading = false;
+     this.playing = true;
+     this.hasPlayback = true;
++    this.animateEpisodeSlide();
+     this.holdBackgroundDuringSwitch = false;
+     this.publishMediaState();
+     this.updateAutoPip();
+@@ -885,6 +923,19 @@
+     }
+     this.syncPipControls();
+     this.scheduleControls();
++  }
++
++  private animateEpisodeSlide(): void {
++    const direction = this.episodeSlideDirection;
++    this.episodeSlideDirection = 0;
++    if (direction === 0 || !this.lifecycle.foreground || this.pipActive || this.videoHeightVp <= 0) {
++      this.episodeSlideY = 0;
++      return;
++    }
++    this.episodeSlideY = direction * this.videoHeightVp;
++    this.getUIContext().animateTo({ duration: 240, curve: Curve.EaseOut }, (): void => {
++      this.episodeSlideY = 0;
++    });
+   }
+ 
+   private update(attempt: PlaybackAttempt, time: number): void {
+@@ -943,19 +994,19 @@
+   }
+ 
+   private finish(attempt: PlaybackAttempt): void {
+-    if (attempt.id !== this.generation || this.completed) {
++    if (attempt.id !== this.generation || this.completed || this.episodeSlidingOut) {
+       return;
+     }
+     this.completed = true;
+     this.positionSeconds = this.duration;
+     this.playing = false;
+-    this.controls = true;
+     this.syncPipControls();
+     this.saveProgress();
+     const episode: Episode | undefined = nextEpisode(this.drama?.episodes ?? [], this.selected?.index ?? 0);
+     if (episode) {
+-      this.openEpisode(episode);
++      this.selectEpisode(episode);
+     } else {
++      this.controls = true;
+       this.holdBackgroundDuringSwitch = false;
+       this.publishMediaState();
+       this.updateAutoPip();
+@@ -1216,7 +1267,11 @@
+     }
+     clearTimeout(this.gestureTimer);
+     clearTimeout(this.controlsTimer);
+-    this.gestureSide = finger.localX < this.videoWidthVp / 2 ? 'brightness' : 'volume';
++    const horizontalPosition = finger.localX / this.videoWidthVp;
++    this.gestureSide = horizontalPosition < 0.3 ? 'brightness' : horizontalPosition > 0.7 ? 'volume' : 'episode';
++    if (this.gestureSide === 'episode') {
++      return;
++    }
+     if (this.gestureSide === 'brightness') {
+       this.syncBrightness();
+     } else {
+@@ -1226,7 +1281,7 @@
+   }
+ 
+   private updateAdjustment(event: GestureEvent): void {
+-    if (!this.gestureSide) {
++    if (!this.gestureSide || this.gestureSide === 'episode') {
+       return;
+     }
+     const value = Math.max(0, Math.min(1, this.gestureOrigin - event.offsetY * 1.45 / this.videoHeightVp));
+@@ -1240,8 +1295,13 @@
+     }
+   }
+ 
+-  private finishAdjustment(): void {
+-    if (this.gestureSide === 'brightness') {
++  private finishAdjustment(offsetY: number = 0): void {
++    if (this.gestureSide === 'episode') {
++      const threshold = Math.max(44, Math.min(88, this.videoHeightVp * 0.13));
++      if (Math.abs(offsetY) >= threshold) {
++        this.stepEpisode(offsetY < 0);
++      }
++    } else if (this.gestureSide === 'brightness') {
+       this.setBrightness(true);
+     }
+     this.gestureSide = '';
+@@ -1256,9 +1316,91 @@
+     }
+   }
+ 
++  private toggleLandscapeFullscreen(): void {
++    if (this.landscapeChanging) {
++      return;
++    }
++    if (this.landscapeFullscreen) {
++      this.exitLandscapeFullscreen();
++      return;
++    }
++    if (!this.landscapeButtonVisible || !this.alive) {
++      return;
++    }
++    this.queueLandscapeChange((): Promise<void> => this.enterLandscapeFullscreen());
++  }
++
++  private async enterLandscapeFullscreen(): Promise<void> {
++    const context = this.getUIContext().getHostContext();
++    if (!context) {
++      return;
++    }
++    try {
++      const main = await window.getLastWindow(context);
++      if (!this.alive || !this.landscapeButtonVisible) {
++        return;
++      }
++      if (main.getWindowStatus() !== window.WindowStatusType.FULL_SCREEN) {
++        this.showMessage('请先退出分屏或悬浮窗，再使用横屏全屏');
++        return;
++      }
++      this.landscapeRestore = {
++        mainWindow: main,
++        orientation: main.getPreferredOrientation(),
++        statusVisible: main.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM).topRect.height > 0,
++        collapsed: this.fullscreen,
++      };
++      this.landscapeFullscreen = true;
++      this.setFullscreen(true);
++      await main.setPreferredOrientation(window.Orientation.USER_ROTATION_LANDSCAPE);
++      if (this.alive) {
++        await main.setSpecificSystemBarEnabled('status', false).catch((): void => {});
++      }
++    } catch (_error) {
++      await this.restoreLandscapeWindow();
++      if (this.alive) {
++        this.showMessage('当前窗口无法进入横屏全屏');
++      }
++    }
++  }
++
++  private exitLandscapeFullscreen(): void {
++    if (!this.landscapeRestore && !this.landscapeChanging) {
++      return;
++    }
++    this.queueLandscapeChange((): Promise<void> => this.restoreLandscapeWindow());
++  }
++
++  private queueLandscapeChange(change: () => Promise<void>): void {
++    this.landscapeChanging = true;
++    const work = this.landscapeWork.then(change).catch((): void => {
++      hilog.warn(0x00F1, 'HongguoPlayer', 'Landscape orientation transition failed');
++    });
++    this.landscapeWork = work;
++    work.then((): void => {
++      if (this.landscapeWork === work) {
++        this.landscapeChanging = false;
++      }
++    });
++  }
++
++  private async restoreLandscapeWindow(): Promise<void> {
++    const saved = this.landscapeRestore;
++    if (!saved) {
++      return;
++    }
++    this.landscapeRestore = undefined;
++    this.landscapeFullscreen = false;
++    if (this.alive) {
++      this.setFullscreen(saved.collapsed);
++    }
++    await saved.mainWindow.setPreferredOrientation(saved.orientation).catch((): void => {});
++    await saved.mainWindow.setSpecificSystemBarEnabled('status', saved.statusVisible).catch((): void => {});
++  }
++
+   private scheduleControls(): void {
+     clearTimeout(this.controlsTimer);
+-    if (this.fullscreen && this.playing && !this.volumePopup) {
++    if ((this.fullscreen || this.landscapeFullscreen) && !this.sideDrawerOpen && this.playing && !this.volumePopup) {
+       this.controlsTimer = setTimeout((): void => { this.controls = false; }, 3600);
+     }
+   }
+@@ -1281,20 +1423,35 @@
+   }
+ 
+   private tapVideo(): void {
+-    if (this.fullscreen) {
+-      clearTimeout(this.controlsTimer);
+-      this.controls = !this.controls;
+-    } else if (!this.loading && this.error.length === 0) {
+-      this.togglePlaying();
+-    }
++    clearTimeout(this.controlsTimer);
++    this.controls = !this.controls;
+   }
+ 
+   private selectEpisode(episode: Episode): void {
++    if (this.episodeSlidingOut) {
++      return;
++    }
+     if (episode.videoId === this.selected?.videoId && this.error.length === 0) {
+       this.sideDrawerOpen = false;
+       return;
+     }
+-    this.openEpisode(episode);
++    const direction = this.selected ? Math.sign(episode.index - this.selected.index) : 0;
++    if (direction === 0 || !this.lifecycle.foreground || this.pipActive || this.videoHeightVp <= 0) {
++      this.openEpisode(episode);
++      return;
++    }
++    this.episodeSlidingOut = true;
++    const generation = this.generation;
++    const handoff = (): void => {
++      if (!this.episodeSlidingOut || !this.alive || generation !== this.generation) {
++        return;
++      }
++      this.openEpisode(episode, 0, false, '', '', true, this.lifecycle.foreground && !this.pipActive ? direction : 0);
++    };
++    this.episodeSlideTimer = setTimeout(handoff, 220);
++    this.getUIContext().animateTo({ duration: 160, curve: Curve.EaseIn, onFinish: handoff }, (): void => {
++      this.episodeSlideY = -direction * this.videoHeightVp;
++    });
+   }
+ 
+   private resetDanmaku(): void {
+@@ -1446,7 +1603,7 @@
+       .width(44)
+       .height(44)
+       .backgroundColor('#4D191519')
+-      .accessibilityText(this.fullscreen ? '退出全屏' : '返回')
++      .accessibilityText(this.fullscreen || this.landscapeFullscreen ? '退出全屏' : '返回')
+       .onClick((): void => this.back())
+ 
+       Text(this.episodeLabel)
+@@ -1605,6 +1762,29 @@
+         .fontColor(Color.White)
+         .maxLines(2)
+         .textOverflow({ overflow: TextOverflow.Ellipsis })
++
++      if (this.landscapeButtonVisible) {
++        Button({ type: ButtonType.Capsule }) {
++          Row({ space: 6 }) {
++            SymbolGlyph(this.landscapeFullscreen ? $r('sys.symbol.arrow_down_right_and_arrow_up_left') :
++              $r('sys.symbol.arrow_up_left_and_arrow_down_right'))
++              .fontSize(18)
++              .fontColor([Color.White])
++            Text(this.landscapeFullscreen ? '退出全屏' : '横屏播放')
++              .fontSize(13)
++              .fontColor(Color.White)
++          }
++          .padding({ left: 12, right: 12 })
++        }
++        .height(44)
++        .backgroundColor('#66000000')
++        .border({ width: 1, color: '#30FFFFFF' })
++        .alignSelf(ItemAlign.Center)
++        .enabled(!this.landscapeChanging)
++        .id('hongguo-landscape-fullscreen')
++        .accessibilityText(this.landscapeFullscreen ? '退出横屏全屏' : '横屏全屏')
++        .onClick((): void => this.toggleLandscapeFullscreen())
++      }
+ 
+       this.SeekBar()
+ 
+@@ -1852,7 +2032,17 @@
+     HdsNavDestination() {
+       Row() {
+         Stack() {
+-          this.VideoSurface()
++          Stack() {
++            this.VideoSurface()
++            if (this.activeDanmaku.length > 0) {
++              this.DanmakuLayer()
++            }
++          }
++          .width('100%')
++          .height('100%')
++          .backgroundColor(Color.Black)
++          .translate({ y: this.episodeSlideY })
++          .hitTestBehavior(HitTestMode.None)
+           if (this.systemVolumeLevel !== undefined && this.lifecycle.foreground) {
+             AVVolumePanel({
+               volumeLevel: this.systemVolumeLevel,
+@@ -1881,7 +2071,7 @@
+               PanGesture({ direction: PanDirection.Vertical, distance: 10 })
+                 .onActionStart((event: GestureEvent): void => this.beginAdjustment(event))
+                 .onActionUpdate((event: GestureEvent): void => this.updateAdjustment(event))
+-                .onActionEnd((): void => this.finishAdjustment())
++                .onActionEnd((event: GestureEvent): void => this.finishAdjustment(event.offsetY))
+                 .onActionCancel((): void => this.finishAdjustment())
+             )
+           if (this.gestureHint.length > 0) {
+@@ -1894,10 +2084,6 @@
+               .id('hongguo-player-adjustment-hint')
+               .hitTestBehavior(HitTestMode.None)
+           }
+-          if (this.activeDanmaku.length > 0) {
+-            this.DanmakuLayer()
+-          }
+-
+           if (this.loading || this.error.length > 0) {
+             Column({ space: 12 }) {
+               if (this.loading) {
+@@ -1982,7 +2168,10 @@
+       .width('100%')
+       .height('100%')
+       .backgroundColor(Color.Black)
+-      .onAreaChange((_old: Area, area: Area): void => { this.widthVp = Number(area.width); })
++      .onAreaChange((_old: Area, area: Area): void => {
++        this.widthVp = Number(area.width);
++        this.heightVp = Number(area.height);
++      })
+     }
+     .hideTitleBar(true)
+     .systemBarStyle({ statusBarContentColor: '#FFFFFF' }, { statusBarContentColor: '#FFFFFF' })
