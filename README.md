@@ -1,56 +1,32 @@
-<p align="center">
-  <img src="https://raw.githubusercontent.com/aston314/hongguo-tv/main/assets/branding/hongguo-icon-circle.svg" width="88" height="88" alt="红果短剧 TV">
-</p>
+# 红果短剧 · HarmonyOS
 
-<h1 align="center">红果短剧 TV</h1>
+面向手机、平板和鸿蒙电脑的红果短剧原生适配，最低兼容 HarmonyOS 6.1.0（API 23）。应用内集成红果 Go 核心，可在设备上独立运行。
 
-<p align="center">Android TV · webOS · macOS · Windows · Linux</p>
+本发布仓库 fork 自 [aston314/hongguo-tv-releases](https://github.com/aston314/hongguo-tv-releases)。鸿蒙版的 Go 核心基于 [aston314/hongguo-tv 的 5414d05 提交](https://github.com/aston314/hongguo-tv/commit/5414d056b4f81b54c5f40dddbf46181d8cb62bf0)。Android TV、webOS 和桌面版继续由 [上游发布页](https://github.com/aston314/hongguo-tv-releases/releases) 提供。
 
-<p align="center">
-  <a href="https://github.com/aston314/hongguo-tv-releases/releases/latest"><img src="https://img.shields.io/github/v/release/aston314/hongguo-tv-releases?filter=v*&amp;sort=semver&amp;display_name=tag&amp;label=%E6%9C%80%E6%96%B0%E6%AD%A3%E5%BC%8F%E7%89%88&amp;style=flat&amp;color=DB411E" alt="最新正式版"></a>
-  <a href="https://github.com/aston314/hongguo-tv-releases/releases"><img src="https://img.shields.io/github/downloads/aston314/hongguo-tv-releases/total?label=%E5%8E%86%E5%8F%B2%E7%B4%AF%E8%AE%A1%E4%B8%8B%E8%BD%BD&amp;style=flat&amp;color=2E7D32" alt="所有历史 Release 发布附件累计下载次数"></a>
-  <a href="https://github.com/aston314/hongguo-tv-releases/issues/new/choose"><img src="https://img.shields.io/badge/%E9%97%AE%E9%A2%98%E5%8F%8D%E9%A6%88-%E6%8F%90%E4%BA%A4%E5%BB%BA%E8%AE%AE-555?style=flat&amp;logo=github&amp;logoColor=white" alt="问题反馈 / 功能建议"></a>
-</p>
+## 界面截图
 
-此仓库提供各平台安装包、版本说明和校验文件。
+| 平板 · 推荐首页 | 手机 · 推荐首页 |
+| --- | --- |
+| <img src="screenshots/harmonyos/tablet-home.jpg" width="650" alt="MatePad 上的今日精选书架和推荐短剧"> | <img src="screenshots/harmonyos/phone-home.jpg" width="220" alt="鸿蒙手机上的推荐首页和悬浮页签"> |
 
-## 当前版本
+| 平板 · 短剧详情 | 平板 · 播放与选集 |
+| --- | --- |
+| <img src="screenshots/harmonyos/tablet-detail.jpg" width="550" alt="左侧剧集简介与右侧选集"> | <img src="screenshots/harmonyos/tablet-player.jpg" width="550" alt="播放器、进度条与右侧选集栏"> |
 
-- [Android TV 最新正式版本](https://github.com/aston314/hongguo-tv-releases/releases/tag/v0.2.164)
-- [LG webOS 测试版 `.ipk`](https://github.com/aston314/hongguo-tv-releases/releases/tag/webos-v0.2.164-test.27)
-- [Linux x86_64 AppImage 测试版](https://github.com/aston314/hongguo-tv-releases/releases/tag/linux-v0.2.164-test.1)
-- [桌面版下载（macOS / Windows）](https://github.com/aston314/hongguo-tv-releases/releases/tag/desktop-v0.2.164)
+## 鸿蒙版功能
 
-全屏连播新增下一季提示，优化观看统计显示与操作，统一官方弹幕表情。
+- 推荐书架、分类与搜索，浮动页签和深浅色适配。
+- 系统画中画、最高 3× 播放、下一集预加载、鸿蒙跨设备接续。
+- 播放侧栏选集与评论，观看历史、收藏、扫码登录和预约。
 
-## Android TV
+## HAP 与安装
 
-标准版和 MPV 版最低支持 Android 6，Android 5.0/5.1 请使用兼容版；支持 ARM64、ARMv7 和 x86_64。首次安装或标准版播放正常时，选择标准版；标准版无法播放时再试 MPV 版。
+鸿蒙构建包含 arm64-v8a 和 x86_64。无签名 HAP 用于后续签名和调试，需在 DevEco Studio 配置设备调试签名后安装。
 
-| 版本 | 下载文件 | 播放方式 |
-| --- | --- | --- |
-| 标准版 | `hongguo-tv-0.2.164.apk` | HTML5 主播放，失败时有限切换到 Media3 |
-| MPV 版 | `hongguo-tv-mpv-0.2.164.apk` | MPV 自动解码，可手动选择软件解码 |
-| Android 5 兼容版 | `hongguo-tv-android5-0.2.164.apk` | HTML5 主播放，失败时有限切换到 Media3 |
+## 来源与版权
 
-三个 APK 支持同一组 Android ABI，使用独立包名，可以同时安装，但账号、历史和设置分别保存。
-
-Android 5 兼容版适用 Android 5.0/5.1，沿用标准版播放方式。已安装旧 Android 5 测试包的用户首次需手动覆盖安装，此后可使用独立在线更新；不承诺适配所有老电视固件与解码器。
-
-## 桌面版
-
-[桌面版 0.2.164](https://github.com/aston314/hongguo-tv-releases/releases/tag/desktop-v0.2.164) 提供 macOS 通用 ZIP 和 Windows x64 ZIP，并支持小窗播放。macOS 需要 11 或更高版本；Windows 需要 Microsoft Edge WebView2 Runtime，播放 HEVC 还需要系统 HEVC Video Extensions。
-
-## webOS
-
-[webOS 0.2.164 测试版](https://github.com/aston314/hongguo-tv-releases/releases/tag/webos-v0.2.164-test.27) 需要 LG Developer Mode 和 webOS 开发工具安装。它是同一应用版本的独立手动测试构建，使用现有 HTML5 播放流程，属于测试版渠道。
-
-## Linux
-
-[Linux x86_64 AppImage 0.2.164 测试版](https://github.com/aston314/hongguo-tv-releases/releases/tag/linux-v0.2.164-test.1) 依赖系统 WebKitGTK、GTK 3、GStreamer 及 HEVC/AAC 解码插件。下载后为文件增加执行权限，再运行 AppImage。
-
-## 更新与反馈
-
-Android 标准版使用 `update.json`，MPV 版使用 `update-mpv.json`，Android 5 兼容版使用 `update-android5.json`。普通用户只需下载 APK；更新清单和校验文件用于应用内更新或核对文件完整性。
-
-播放异常请附设备型号、Android/webOS/桌面系统版本、使用的安装包，以及应用内“播放诊断”截图。Windows 播放 HEVC 时请同时确认系统已安装 HEVC Video Extensions。
+- 上游原项目及 Go 核心的著作权归 **aston314 及相关贡献者**。上游源码仓库当前未附通用分发许可证。 [hongguo-tv](https://github.com/aston314/hongguo-tv)
+- 部分 HDS 导航和播放器界面改编自 **crazypig321 的 FQHouseOH 1.1.3**，沿用 GPL-3.0 声明。 [FQHouseOH 源码](https://github.com/crazypig321/FQHouseOH/tree/68cc833b46292264761c09d88fcfe335b8078246) · [GPL-3.0 许可证](https://github.com/crazypig321/FQHouseOH/blob/68cc833b46292264761c09d88fcfe335b8078246/LICENSE)
+- 设置图标来自 OpenHarmony `applications_settings`，遵循 Apache-2.0。 [OpenHarmony 设置应用源码](https://gitcode.com/openharmony/applications_settings)
+- 红果短剧名称、标识及截图中的封面和剧照归各自权利人。截图用于展示鸿蒙版界面。
