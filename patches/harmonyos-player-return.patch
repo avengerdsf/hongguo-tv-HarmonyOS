@@ -1,7 +1,31 @@
 diff --git a/harmony/entry/src/main/ets/pages/PlayerPage.ets b/harmony/entry/src/main/ets/pages/PlayerPage.ets
 --- a/harmony/entry/src/main/ets/pages/PlayerPage.ets
 +++ b/harmony/entry/src/main/ets/pages/PlayerPage.ets
-@@ -190,6 +190,7 @@
+@@ -64,6 +64,7 @@
+   orientation: window.Orientation;
+   statusVisible: boolean;
+   collapsed: boolean;
++  portrait: boolean;
+ }
+ 
+ interface EpisodeDragPreview {
+@@ -116,6 +117,7 @@
+   @Local heightVp: number = 0;
+   @Local landscapeFullscreen: boolean = false;
+   @Local landscapeChanging: boolean = false;
++  @Local awaitingPortraitLayout: boolean = false;
+   @Local videoWidthVp: number = 0;
+   @Local videoHeightVp: number = 0;
+   @Local videoAspectRatio: number = 0;
+@@ -163,6 +165,7 @@
+   private pipAutoArmed: boolean = false;
+   private backgroundTimer: number = -1;
+   private landscapeRestore?: LandscapeRestore;
++  private landscapePanelTimer: number = -1;
+   private landscapeWork: Promise<void> = Promise.resolve();
+   private mediaSession?: PlaybackMediaSession;
+   private holdBackgroundDuringSwitch: boolean = false;
+@@ -190,6 +193,7 @@
    private gestureTimer: number = -1;
    private api: HongguoApi = new HongguoApi();
    private alive: boolean = false;
@@ -9,7 +33,24 @@ diff --git a/harmony/entry/src/main/ets/pages/PlayerPage.ets b/harmony/entry/src
    private generation: number = 0;
    private prefetchedEpisode?: EpisodePrefetch;
    private autoPlayOnPrepare: boolean = true;
-@@ -576,6 +577,9 @@
+@@ -228,7 +232,7 @@
+ 
+   @Computed
+   get wide(): boolean {
+-    return !this.landscapeFullscreen && this.widthVp >= 840;
++    return !this.landscapeFullscreen && !this.landscapeChanging && !this.awaitingPortraitLayout && this.widthVp >= 840;
+   }
+ 
+   @Computed
+@@ -567,6 +571,7 @@
+     this.episodeDragPreview = undefined;
+     this.mediaSession?.close();
+     this.mediaSession = undefined;
++    this.clearPortraitLayoutWait();
+     this.exitLandscapeFullscreen();
+     this.restoreBrightness();
+     this.releaseMediaVolume();
+@@ -576,6 +581,9 @@
    }
  
    private back(): void {
@@ -19,7 +60,7 @@ diff --git a/harmony/entry/src/main/ets/pages/PlayerPage.ets b/harmony/entry/src
      if (this.commentsVisible && this.wide) {
        this.commentsVisible = false;
        return;
-@@ -592,7 +596,7 @@
+@@ -592,7 +600,7 @@
        this.setFullscreen(false);
        return;
      }
@@ -28,7 +69,7 @@ diff --git a/harmony/entry/src/main/ets/pages/PlayerPage.ets b/harmony/entry/src
      this.onBack();
    }
  
-@@ -1026,7 +1030,7 @@
+@@ -1026,7 +1034,7 @@
    }
  
    private finish(attempt: PlaybackAttempt): void {
@@ -37,7 +78,45 @@ diff --git a/harmony/entry/src/main/ets/pages/PlayerPage.ets b/harmony/entry/src
        return;
      }
      if (this.gestureSide === 'episode') {
-@@ -1522,7 +1526,7 @@
+@@ -1438,11 +1446,13 @@
+         this.showMessage('请先退出分屏或悬浮窗，再使用横屏全屏');
+         return;
+       }
++      this.clearPortraitLayoutWait();
+       this.landscapeRestore = {
+         mainWindow: main,
+         orientation: main.getPreferredOrientation(),
+         statusVisible: main.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM).topRect.height > 0,
+         collapsed: this.fullscreen,
++        portrait: this.widthVp > 0 && this.widthVp < this.heightVp,
+       };
+       this.landscapeFullscreen = true;
+       this.setFullscreen(true);
+@@ -1484,12 +1494,21 @@
+       return;
+     }
+     this.landscapeRestore = undefined;
++    await saved.mainWindow.setPreferredOrientation(saved.orientation).catch((): void => {});
++    await saved.mainWindow.setSpecificSystemBarEnabled('status', saved.statusVisible).catch((): void => {});
++    if (this.alive && saved.portrait && this.widthVp >= this.heightVp) {
++      this.awaitingPortraitLayout = true;
++      this.landscapePanelTimer = setTimeout((): void => this.clearPortraitLayoutWait(), 480);
++    }
+     this.landscapeFullscreen = false;
+     if (this.alive) {
+       this.setFullscreen(saved.collapsed);
+     }
+-    await saved.mainWindow.setPreferredOrientation(saved.orientation).catch((): void => {});
+-    await saved.mainWindow.setSpecificSystemBarEnabled('status', saved.statusVisible).catch((): void => {});
++  }
++
++  private clearPortraitLayoutWait(): void {
++    clearTimeout(this.landscapePanelTimer);
++    this.awaitingPortraitLayout = false;
+   }
+ 
+   private scheduleControls(): void {
+@@ -1522,7 +1541,7 @@
    }
  
    private selectEpisode(episode: Episode, followDrag: boolean = false): void {
@@ -46,7 +125,13 @@ diff --git a/harmony/entry/src/main/ets/pages/PlayerPage.ets b/harmony/entry/src
        return;
      }
      if (episode.videoId === this.selected?.videoId && this.error.length === 0) {
-@@ -2304,11 +2308,12 @@
+@@ -2301,14 +2320,18 @@
+       .onAreaChange((_old: Area, area: Area): void => {
+         this.widthVp = Number(area.width);
+         this.heightVp = Number(area.height);
++        if (this.awaitingPortraitLayout && this.widthVp < this.heightVp) {
++          this.clearPortraitLayoutWait();
++        }
        })
      }
      .hideTitleBar(true)
