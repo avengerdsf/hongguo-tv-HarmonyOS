@@ -19,14 +19,14 @@
 - 推荐书架、分类与搜索，浮动页签和深浅色适配。
 - 系统播控中心支持播放、暂停、切集和进度控制。设置中可分别开启后台播放和自动画中画。
 - 最高 3× 播放、下一集预加载、鸿蒙跨设备接续。整季播完后可继续观看已上线的下一季，或预约尚未上线且开放预约的下一季。
-- 手机和竖屏平板播放横屏片源时可进入横屏全屏。画面中央上下滑逐集切换，单击显隐控件，双击播放或暂停。
+- 手机和竖屏平板播放横屏片源时可进入横屏全屏。画面中央上下拖动时，当前画面与相邻集预览跟手移动；滑到位松手后切一集，短拖回弹。单击显隐控件，双击播放或暂停。从播放器返回详情时，播放页向右滑出。
 - 播放侧栏选集与评论，观看历史、收藏、扫码登录和预约。
 
 ## HAP 与安装
 
 鸿蒙构建包含 arm64-v8a 和 x86_64。无签名 HAP 用于后续签名和调试，需在 DevEco Studio 配置设备调试签名后安装。
 
-本次鸿蒙侧更新提供[播控与后台播放补丁](patches/harmonyos-media-session.patch)和[横屏与手势补丁](patches/harmonyos-player-gestures.patch)。从更新前的鸿蒙适配源码根目录依次应用这两个补丁。
+本次鸿蒙侧更新提供[播控与后台播放补丁](patches/harmonyos-media-session.patch)、[横屏与手势补丁](patches/harmonyos-player-gestures.patch)、[跟手切集补丁](patches/harmonyos-follow-touch-episode-drag.patch)和[返回滑出补丁](patches/harmonyos-player-return.patch)。从更新前的鸿蒙适配源码根目录依次应用这四个补丁。
 
 ## 来源与版权
 

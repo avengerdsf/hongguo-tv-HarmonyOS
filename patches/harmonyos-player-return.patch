@@ -1,0 +1,62 @@
+diff --git a/harmony/entry/src/main/ets/pages/PlayerPage.ets b/harmony/entry/src/main/ets/pages/PlayerPage.ets
+--- a/harmony/entry/src/main/ets/pages/PlayerPage.ets
++++ b/harmony/entry/src/main/ets/pages/PlayerPage.ets
+@@ -190,6 +190,7 @@
+   private gestureTimer: number = -1;
+   private api: HongguoApi = new HongguoApi();
+   private alive: boolean = false;
++  private returningToDetail: boolean = false;
+   private generation: number = 0;
+   private prefetchedEpisode?: EpisodePrefetch;
+   private autoPlayOnPrepare: boolean = true;
+@@ -576,6 +577,9 @@
+   }
+ 
+   private back(): void {
++    if (!this.alive || this.landscapeChanging || this.returningToDetail) {
++      return;
++    }
+     if (this.commentsVisible && this.wide) {
+       this.commentsVisible = false;
+       return;
+@@ -592,7 +596,7 @@
+       this.setFullscreen(false);
+       return;
+     }
+-    this.leave();
++    this.returningToDetail = true;
+     this.onBack();
+   }
+ 
+@@ -1026,7 +1030,7 @@
+   }
+ 
+   private finish(attempt: PlaybackAttempt): void {
+-    if (attempt.id !== this.generation || this.completed || this.episodeSlidingOut) {
++    if (attempt.id !== this.generation || this.completed || this.episodeSlidingOut || this.returningToDetail) {
+       return;
+     }
+     if (this.gestureSide === 'episode') {
+@@ -1522,7 +1526,7 @@
+   }
+ 
+   private selectEpisode(episode: Episode, followDrag: boolean = false): void {
+-    if (this.episodeSlidingOut) {
++    if (this.episodeSlidingOut || this.returningToDetail) {
+       return;
+     }
+     if (episode.videoId === this.selected?.videoId && this.error.length === 0) {
+@@ -2304,11 +2308,12 @@
+       })
+     }
+     .hideTitleBar(true)
++    .systemTransition(NavigationSystemTransitionType.SLIDE_RIGHT)
+     .systemBarStyle({ statusBarContentColor: '#FFFFFF' }, { statusBarContentColor: '#FFFFFF' })
+     .background(Color.Black)
+     .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
+     .onHidden((): void => {
+-      if (!this.pipActive && !this.pipStarting &&
++      if (!this.returningToDetail && !this.pipActive && !this.pipStarting &&
+         (this.lifecycle.foreground || (!this.canKeepPlaying() && !this.pipAutoArmed))) {
+         this.leave();
+       }
